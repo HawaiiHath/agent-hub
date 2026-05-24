@@ -32,7 +32,11 @@ AGENTS_CONFIG = os.environ.get(
 )
 _ALLOWED_HOSTS_DEFAULT = "127.0.0.1:*,localhost:*"
 ALLOWED_HOSTS = os.environ.get("AGENT_HUB_ALLOWED_HOSTS", _ALLOWED_HOSTS_DEFAULT).split(",")
-TZ = timezone(timedelta(hours=8))
+_TZ_OFFSET = os.environ.get("AGENT_HUB_TZ")
+if _TZ_OFFSET is not None:
+    TZ = timezone(timedelta(hours=int(_TZ_OFFSET)))
+else:
+    TZ = datetime.now().astimezone().tzinfo
 BIND_ADDR = os.environ.get("AGENT_HUB_BIND_ADDR", "0.0.0.0")
 
 # 输入大小限制（可通过环境变量调整）
