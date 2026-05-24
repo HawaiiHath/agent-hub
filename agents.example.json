@@ -1,0 +1,25 @@
+{
+  "_comment": "复制此文件为 agents.json，替换其中的 token 为真实值。每个 agent 使用不同的随机 token（可用 openssl rand -hex 16 生成）。",
+  "agents": {
+    "在此填入你的随机token": {
+      "id": "home-claude-code",
+      "name": "家里的 Claude Code",
+      "device": "home"
+    },
+    "每个agent使用不同的token": {
+      "id": "work-claude-code",
+      "name": "工作的 Claude Code",
+      "device": "work"
+    },
+    "token通过SHA256哈希存储": {
+      "id": "work-hermes",
+      "name": "工作的 Hermes",
+      "device": "work"
+    },
+    "原始token仅存在于本文件和客户端mcp配置中": {
+      "id": "vps-openclaw",
+      "name": "VPS OpenClaw",
+      "device": "vps"
+    }
+  }
+}
