@@ -7,9 +7,10 @@ Type=simple
 User=root
 WorkingDirectory=/root/agent-hub
 Environment=AGENT_HUB_PORT=9020
-Environment=AGENT_HUB_ALLOWED_HOSTS=127.0.0.1:*,localhost:*
+Environment=AGENT_HUB_ALLOWED_HOSTS=agenthub.hawaiihath.com,agenthub.hawaiihath.com:*,localhost,localhost:*,127.0.0.1,127.0.0.1:*
 Environment=AGENT_HUB_DB=/root/agent-hub/hub.db
 Environment=AGENT_HUB_AGENTS=/root/agent-hub/agents.json
+Environment=AGENT_HUB_BIND_ADDR=127.0.0.1
 ExecStart=/usr/bin/python3 server.py
 Restart=always
 RestartSec=5
