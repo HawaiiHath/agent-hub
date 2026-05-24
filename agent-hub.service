@@ -1,0 +1,21 @@
+[Unit]
+Description=agent-hub MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+WorkingDirectory=/opt/agent-hub
+Environment=AGENT_HUB_PORT=9020
+Environment=AGENT_HUB_ALLOWED_HOSTS=127.0.0.1:*,localhost:*
+Environment=AGENT_HUB_DB=/opt/agent-hub/hub.db
+Environment=AGENT_HUB_AGENTS=/opt/agent-hub/agents.json
+ExecStart=/usr/bin/python3 server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-hub
+
+[Install]
+WantedBy=multi-user.target

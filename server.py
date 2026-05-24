@@ -19,6 +19,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent
 import uvicorn
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -32,14 +34,57 @@ _ALLOWED_HOSTS_DEFAULT = "127.0.0.1:*,localhost:*"
 ALLOWED_HOSTS = os.environ.get("AGENT_HUB_ALLOWED_HOSTS", _ALLOWED_HOSTS_DEFAULT).split(",")
 TZ = timezone(timedelta(hours=8))
 
+# 消息/任务保留天数（可通过环境变量调整，默认 30 天）
+MESSAGE_RETENTION_DAYS = int(os.environ.get("AGENT_HUB_MESSAGE_RETENTION_DAYS", "30"))
+TASK_RETENTION_DAYS = int(os.environ.get("AGENT_HUB_TASK_RETENTION_DAYS", "30"))
+CLEANUP_INTERVAL_SEC = int(os.environ.get("AGENT_HUB_CLEANUP_INTERVAL_SEC", "3600"))
+
+
+async def cleanup_loop():
+    """后台定期清理过期消息和已完成/取消的任务"""
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL_SEC)
+        try:
+            conn = get_db()
+            msg_cutoff = int(time.time()) - MESSAGE_RETENTION_DAYS * 86400
+            task_cutoff = int(time.time()) - TASK_RETENTION_DAYS * 86400
+
+            # 只清理已读消息
+            deleted_msgs = conn.execute(
+                "DELETE FROM messages WHERE is_read=1 AND created_at < ?", (msg_cutoff,)
+            ).rowcount
+
+            # 只清理已完成或已取消的旧任务
+            deleted_tasks = conn.execute(
+                "DELETE FROM tasks WHERE status IN ('done','cancelled') AND created_at < ?",
+                (task_cutoff,),
+            ).rowcount
+
+            conn.commit()
+            conn.close()
+
+            if deleted_msgs or deleted_tasks:
+                logging.getLogger("agent-hub").info(
+                    "cleanup: removed %d messages, %d tasks", deleted_msgs, deleted_tasks
+                )
+        except Exception:
+            logging.getLogger("agent-hub").exception("cleanup error")
+
 # ---------------------------------------------------------------------------
 # Token 日志脱敏
 # ---------------------------------------------------------------------------
 class TokenSanitizer(logging.Filter):
     def filter(self, record):
-        msg = record.getMessage()
-        record.msg = re.sub(r'token=[^&\s"]+', 'token=***', msg)
-        record.args = ()
+        if record.args:
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    re.sub(r'token=[^&\s"\']+', 'token=***', a) if isinstance(a, str) else a
+                    for a in record.args
+                )
+            elif isinstance(record.args, dict):
+                for k in list(record.args.keys()):
+                    if isinstance(record.args[k], str):
+                        record.args[k] = re.sub(r'token=[^&\s"\']+', 'token=***', record.args[k])
         return True
 
 # ---------------------------------------------------------------------------
@@ -508,11 +553,42 @@ async def list_agents() -> str:
 
 
 # ===================================================================
+# 健康检查端点
+# ===================================================================
+
+async def health_endpoint(request):
+    try:
+        conn = get_db()
+        conn.execute("SELECT 1")
+        conn.close()
+        db_ok = True
+    except Exception:
+        db_ok = False
+
+    try:
+        conn = get_db()
+        online = conn.execute("SELECT COUNT(*) as cnt FROM agents WHERE is_online=1").fetchone()["cnt"]
+        total = conn.execute("SELECT COUNT(*) as cnt FROM agents").fetchone()["cnt"]
+        conn.close()
+    except Exception:
+        online = 0
+        total = 0
+
+    return JSONResponse({
+        "status": "ok" if db_ok else "degraded",
+        "database": "ok" if db_ok else "error",
+        "agents_online": online,
+        "agents_total": total,
+    })
+
+
+# ===================================================================
 # 启动
 # ===================================================================
 
 def create_app():
     app = mcp.sse_app()
+    app.routes.insert(0, Route("/health", health_endpoint, methods=["GET"]))
     for i, item in enumerate(app.user_middleware):
         if item[0] == AuthMiddleware:
             break
@@ -530,4 +606,12 @@ if __name__ == "__main__":
     uvicorn_logger.addFilter(TokenSanitizer())
     print(f"🚀 agent-hub 启动在 http://0.0.0.0:{port}")
     print(f"   allowed_hosts: {ALLOWED_HOSTS}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    async def main():
+        cleanup_task = asyncio.create_task(cleanup_loop())
+        config = uvicorn.Config(app, host="0.0.0.0", port=port)
+        server = uvicorn.Server(config)
+        await server.serve()
+        cleanup_task.cancel()
+
+    asyncio.run(main())
