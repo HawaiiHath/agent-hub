@@ -13,6 +13,7 @@ Environment=AGENT_HUB_AGENTS=/opt/agent-hub/agents.json
 ExecStart=/usr/bin/python3 server.py
 Restart=always
 RestartSec=5
+TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=agent-hub

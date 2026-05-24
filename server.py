@@ -33,11 +33,20 @@ AGENTS_CONFIG = os.environ.get(
 _ALLOWED_HOSTS_DEFAULT = "127.0.0.1:*,localhost:*"
 ALLOWED_HOSTS = os.environ.get("AGENT_HUB_ALLOWED_HOSTS", _ALLOWED_HOSTS_DEFAULT).split(",")
 TZ = timezone(timedelta(hours=8))
+BIND_ADDR = os.environ.get("AGENT_HUB_BIND_ADDR", "0.0.0.0")
+
+# 输入大小限制（可通过环境变量调整）
+MAX_SUBJECT_LEN = int(os.environ.get("AGENT_HUB_MAX_SUBJECT_LEN", "500"))
+MAX_BODY_LEN = int(os.environ.get("AGENT_HUB_MAX_BODY_LEN", "50000"))
+MAX_DESCRIPTION_LEN = int(os.environ.get("AGENT_HUB_MAX_DESCRIPTION_LEN", "2000"))
+MAX_CONTEXT_LEN = int(os.environ.get("AGENT_HUB_MAX_CONTEXT_LEN", "5000"))
 
 # 消息/任务保留天数（可通过环境变量调整，默认 30 天）
 MESSAGE_RETENTION_DAYS = int(os.environ.get("AGENT_HUB_MESSAGE_RETENTION_DAYS", "30"))
 TASK_RETENTION_DAYS = int(os.environ.get("AGENT_HUB_TASK_RETENTION_DAYS", "30"))
 CLEANUP_INTERVAL_SEC = int(os.environ.get("AGENT_HUB_CLEANUP_INTERVAL_SEC", "3600"))
+HEARTBEAT_INTERVAL_SEC = int(os.environ.get("AGENT_HUB_HEARTBEAT_INTERVAL_SEC", "300"))
+AGENT_OFFLINE_THRESHOLD_SEC = int(os.environ.get("AGENT_HUB_OFFLINE_THRESHOLD_SEC", "600"))
 
 
 async def cleanup_loop():
@@ -48,16 +57,27 @@ async def cleanup_loop():
             conn = get_db()
             msg_cutoff = int(time.time()) - MESSAGE_RETENTION_DAYS * 86400
             task_cutoff = int(time.time()) - TASK_RETENTION_DAYS * 86400
+            deleted_cutoff = int(time.time()) - 7 * 86400  # 软删除 7 天后彻底清除
 
-            # 只清理已读消息
+            # 清理已读消息
             deleted_msgs = conn.execute(
-                "DELETE FROM messages WHERE is_read=1 AND created_at < ?", (msg_cutoff,)
+                "DELETE FROM messages WHERE is_read=1 AND is_deleted=0 AND created_at < ?", (msg_cutoff,)
             ).rowcount
 
-            # 只清理已完成或已取消的旧任务
+            # 清理软删除的消息（7天后彻底删除）
+            deleted_msgs += conn.execute(
+                "DELETE FROM messages WHERE is_deleted=1 AND created_at < ?", (deleted_cutoff,)
+            ).rowcount
+
+            # 清理已完成或已取消的旧任务
             deleted_tasks = conn.execute(
-                "DELETE FROM tasks WHERE status IN ('done','cancelled') AND created_at < ?",
+                "DELETE FROM tasks WHERE status IN ('done','cancelled') AND is_deleted=0 AND created_at < ?",
                 (task_cutoff,),
+            ).rowcount
+
+            # 清理软删除的任务（7天后彻底删除）
+            deleted_tasks += conn.execute(
+                "DELETE FROM tasks WHERE is_deleted=1 AND created_at < ?", (deleted_cutoff,)
             ).rowcount
 
             conn.commit()
@@ -69,6 +89,27 @@ async def cleanup_loop():
                 )
         except Exception:
             logging.getLogger("agent-hub").exception("cleanup error")
+
+
+async def heartbeat_loop():
+    """后台定期将长时间未活跃的 agent 标记为离线"""
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+        try:
+            conn = get_db()
+            cutoff = int(time.time()) - AGENT_OFFLINE_THRESHOLD_SEC
+            affected = conn.execute(
+                "UPDATE agents SET is_online=0 WHERE is_online=1 AND last_seen < ?",
+                (cutoff,),
+            ).rowcount
+            conn.commit()
+            conn.close()
+            if affected:
+                logging.getLogger("agent-hub").info(
+                    "heartbeat: marked %d agent(s) offline", affected
+                )
+        except Exception:
+            logging.getLogger("agent-hub").exception("heartbeat error")
 
 # ---------------------------------------------------------------------------
 # Token 日志脱敏
@@ -156,6 +197,14 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_by, created_at);
     """)
     conn.commit()
+
+    # 迁移：为旧数据库添加 is_deleted 列
+    for table in ("messages", "tasks"):
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+
     conn.close()
 
 
@@ -239,12 +288,29 @@ def _caller_name() -> str:
     return current_agent_name.get()
 
 
+def _validate_input(**kwargs) -> str | None:
+    """验证输入大小限制，返回错误消息或 None"""
+    limits = {
+        "subject": MAX_SUBJECT_LEN,
+        "body": MAX_BODY_LEN,
+        "description": MAX_DESCRIPTION_LEN,
+        "context": MAX_CONTEXT_LEN,
+    }
+    for field, value in kwargs.items():
+        limit = limits.get(field)
+        if limit and isinstance(value, str) and len(value) > limit:
+            return f"❌ {field} 超过最大长度限制（{limit} 字符）"
+    return None
+
+
 # ===================================================================
 # 工具：消息信箱
 # ===================================================================
 
 @mcp.tool(name="send_message", description="向其他智能体发送消息。recipient 填 agent_id 或 'all' 广播")
 async def send_message(recipient: str, subject: str, body: str, priority: str = "normal") -> str:
+    if err := _validate_input(subject=subject, body=body):
+        return err
     sender = _caller()
     if recipient == "all":
         conn = get_db()
@@ -277,7 +343,7 @@ async def check_mailbox(limit: int = 20) -> str:
     conn = get_db()
     rows = conn.execute(
         "SELECT id, sender_id, subject, priority, datetime(created_at,'unixepoch','localtime') as ts "
-        "FROM messages WHERE recipient_id=? AND is_read=0 ORDER BY created_at DESC LIMIT ?",
+        "FROM messages WHERE recipient_id=? AND is_read=0 AND is_deleted=0 ORDER BY created_at DESC LIMIT ?",
         (agent, limit),
     ).fetchall()
     conn.close()
@@ -298,7 +364,7 @@ async def read_message(message_id: int) -> str:
     agent = _caller()
     conn = get_db()
     row = conn.execute(
-        "SELECT * FROM messages WHERE id=? AND recipient_id=?", (message_id, agent)
+        "SELECT * FROM messages WHERE id=? AND recipient_id=? AND is_deleted=0", (message_id, agent)
     ).fetchone()
     if not row:
         conn.close()
@@ -322,7 +388,7 @@ async def reply_message(message_id: int, body: str) -> str:
     agent = _caller()
     conn = get_db()
     original = conn.execute(
-        "SELECT * FROM messages WHERE id=? AND recipient_id=?", (message_id, agent)
+        "SELECT * FROM messages WHERE id=? AND recipient_id=? AND is_deleted=0", (message_id, agent)
     ).fetchone()
     if not original:
         conn.close()
@@ -338,6 +404,24 @@ async def reply_message(message_id: int, body: str) -> str:
     conn.commit()
     conn.close()
     return f"✅ 已回复 {original['sender_id']}（消息 ID: {mid}）"
+
+
+@mcp.tool(name="delete_message", description="软删除一条发给自己的消息")
+async def delete_message(message_id: int) -> str:
+    agent = _caller()
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM messages WHERE id=? AND recipient_id=? AND is_deleted=0",
+        (message_id, agent),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return "❌ 消息不存在、不是发给你的、或已被删除"
+
+    conn.execute("UPDATE messages SET is_deleted=1 WHERE id=?", (message_id,))
+    conn.commit()
+    conn.close()
+    return f"✅ 消息 [{message_id}] 已删除"
 
 
 # ===================================================================
@@ -406,6 +490,8 @@ async def get_mcp_config(config_id: int) -> str:
 
 @mcp.tool(name="add_task", description="创建一个任务分配给指定 agent。assigned_to 填 agent_id 或 'any' 表示谁都可以接")
 async def add_task(description: str, assigned_to: str = "any", deadline: str = "", context: str = "") -> str:
+    if err := _validate_input(description=description, context=context):
+        return err
     agent = _caller()
     deadline_ts = None
     if deadline:
@@ -435,7 +521,7 @@ async def get_my_tasks(status: str = "pending") -> str:
         "datetime(created_at,'unixepoch','localtime') as ts "
         "FROM tasks "
         "WHERE (assigned_to=? OR assigned_to='any' OR (assigned_to='*' AND status='pending')) "
-        "AND status=? "
+        "AND status=? AND is_deleted=0 "
         "ORDER BY created_at DESC",
         (agent, status),
     ).fetchall()
@@ -456,6 +542,8 @@ async def get_my_tasks(status: str = "pending") -> str:
 
 @mcp.tool(name="update_task", description="更新任务状态。status: claimed/in_progress/done/cancelled")
 async def update_task(task_id: int, status: str, result_note: str = "") -> str:
+    if err := _validate_input(description=result_note):
+        return err
     agent = _caller()
     valid = {"claimed", "in_progress", "done", "cancelled"}
     if status not in valid:
@@ -466,6 +554,12 @@ async def update_task(task_id: int, status: str, result_note: str = "") -> str:
     if not row:
         conn.close()
         return "❌ 任务不存在"
+
+    # 授权检查：仅创建者、被分配者、或认领者可修改
+    allowed = {row["created_by"], row["assigned_to"], row["claimed_by"]}
+    if agent not in allowed and row["assigned_to"] not in ("any", "*") and agent != "system":
+        conn.close()
+        return "❌ 你没有权限修改此任务"
 
     if status == "claimed":
         conn.execute(
@@ -499,16 +593,37 @@ async def update_task(task_id: int, status: str, result_note: str = "") -> str:
     return f"✅ 任务 [{task_id}] 状态已更新为 {status}"
 
 
+@mcp.tool(name="delete_task", description="软删除一个自己创建且尚未开始的任务")
+async def delete_task(task_id: int) -> str:
+    agent = _caller()
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE id=? AND created_by=? AND is_deleted=0",
+        (task_id, agent),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return "❌ 任务不存在、不是你创建的、或已被删除"
+    if row["status"] not in ("pending",):
+        conn.close()
+        return "❌ 只能删除状态为 pending 的任务"
+
+    conn.execute("UPDATE tasks SET is_deleted=1 WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
+    return f"✅ 任务 [{task_id}] 已删除"
+
+
 @mcp.tool(name="list_all_tasks", description="查看所有任务（不限分配对象），方便了解全局任务状况")
 async def list_all_tasks(status: str = "") -> str:
     conn = get_db()
     if status:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE status=? ORDER BY created_at DESC", (status,)
+            "SELECT * FROM tasks WHERE status=? AND is_deleted=0 ORDER BY created_at DESC", (status,)
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM tasks ORDER BY created_at DESC LIMIT 50"
+            "SELECT * FROM tasks WHERE is_deleted=0 ORDER BY created_at DESC LIMIT 50"
         ).fetchall()
     conn.close()
 
@@ -604,14 +719,23 @@ if __name__ == "__main__":
     port = int(os.environ.get("AGENT_HUB_PORT", "9020"))
     uvicorn_logger = logging.getLogger("uvicorn.access")
     uvicorn_logger.addFilter(TokenSanitizer())
-    print(f"🚀 agent-hub 启动在 http://0.0.0.0:{port}")
+    print(f"🚀 agent-hub 启动在 http://{BIND_ADDR}:{port}")
     print(f"   allowed_hosts: {ALLOWED_HOSTS}")
 
     async def main():
         cleanup_task = asyncio.create_task(cleanup_loop())
-        config = uvicorn.Config(app, host="0.0.0.0", port=port)
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
+        config = uvicorn.Config(app, host=BIND_ADDR, port=port)
         server = uvicorn.Server(config)
-        await server.serve()
-        cleanup_task.cancel()
+        try:
+            await server.serve()
+        finally:
+            cleanup_task.cancel()
+            heartbeat_task.cancel()
+            try:
+                await asyncio.gather(cleanup_task, heartbeat_task)
+            except asyncio.CancelledError:
+                pass
+            print("👋 agent-hub 已安全关闭")
 
     asyncio.run(main())
