@@ -199,11 +199,24 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_msg_sender ON messages(sender_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, assigned_to);
         CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_by, created_at);
+
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL,
+            updated_by TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_notes_title ON notes(title);
+        CREATE INDEX IF NOT EXISTS idx_notes_tags ON notes(tags);
     """)
     conn.commit()
 
     # 迁移：为旧数据库添加 is_deleted 列
-    for table in ("messages", "tasks"):
+    for table in ("messages", "tasks", "notes"):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
@@ -644,6 +657,106 @@ async def list_all_tasks(status: str = "") -> str:
             f"  [{r['id']}] {emoji}{st} →{r['assigned_to']}{claimed} {r['description'][:60]}{dl}"
         )
     return "\n".join(lines)
+
+
+# ===================================================================
+# 工具：共享笔记
+# ===================================================================
+
+@mcp.tool(name="save_note", description="保存或更新笔记。同标题默认覆盖，用于跨设备共享参考资料、搭建框架等不会过期的内容")
+async def save_note(title: str, content: str, tags: str = "") -> str:
+    if len(title) > 500 or len(content) > 50000:
+        return "❌ 标题（≤500字符）或内容（≤50000字符）超过限制"
+    agent = _caller()
+    conn = get_db()
+    now = int(time.time())
+    existing = conn.execute("SELECT id FROM notes WHERE title=? AND is_deleted=0", (title,)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE notes SET content=?, tags=?, updated_by=?, updated_at=? WHERE id=?",
+            (content, tags, agent, now, existing["id"]),
+        )
+        conn.commit()
+        conn.close()
+        return f"✅ 笔记『{title}』已更新"
+    else:
+        conn.execute(
+            "INSERT INTO notes(title, content, tags, created_by, updated_by, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (title, content, tags, agent, agent, now, now),
+        )
+        conn.commit()
+        conn.close()
+        return f"✅ 笔记『{title}』已保存"
+
+
+@mcp.tool(name="search_notes", description="搜索共享笔记的标题和标签，返回匹配列表")
+async def search_notes(query: str, limit: int = 10) -> str:
+    conn = get_db()
+    like = f"%{query}%"
+    rows = conn.execute(
+        "SELECT id, title, tags, updated_by, datetime(updated_at,'unixepoch','localtime') as ts "
+        "FROM notes WHERE is_deleted=0 AND (title LIKE ? OR tags LIKE ?) "
+        "ORDER BY updated_at DESC LIMIT ?",
+        (like, like, limit),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return f"📭 没有找到与 '{query}' 相关的笔记"
+    lines = [f"📋 搜索 '{query}' 的结果:"]
+    for r in rows:
+        tags_str = f" [{r['tags']}]" if r["tags"] else ""
+        lines.append(f"  [{r['id']}] {r['title']}{tags_str} （{r['updated_by']}，{r['ts']}）")
+    return "\n".join(lines)
+
+
+@mcp.tool(name="get_note", description="读取笔记全文")
+async def get_note(note_id: int) -> str:
+    conn = get_db()
+    row = conn.execute("SELECT * FROM notes WHERE id=? AND is_deleted=0", (note_id,)).fetchone()
+    conn.close()
+    if not row:
+        return "❌ 笔记不存在"
+    return (
+        f"📝 {row['title']}\n"
+        f"标签: {row['tags'] or '无'}\n"
+        f"创建: {row['created_by']} | 更新: {row['updated_by']} | "
+        f"时间: {datetime.fromtimestamp(row['updated_at'], TZ).strftime('%Y-%m-%d %H:%M')}\n"
+        f"---\n{row['content']}"
+    )
+
+
+@mcp.tool(name="list_notes", description="列出所有共享笔记的标题和标签，支持分页")
+async def list_notes(limit: int = 20, offset: int = 0) -> str:
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) as cnt FROM notes WHERE is_deleted=0").fetchone()["cnt"]
+    rows = conn.execute(
+        "SELECT id, title, tags, updated_by, datetime(updated_at,'unixepoch','localtime') as ts "
+        "FROM notes WHERE is_deleted=0 ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return "📭 没有笔记"
+    lines = [f"📋 共享笔记（共 {total} 篇）:"]
+    for r in rows:
+        tags_str = f" [{r['tags']}]" if r["tags"] else ""
+        lines.append(f"  [{r['id']}] {r['title']}{tags_str} （{r['updated_by']}，{r['ts']}）")
+    return "\n".join(lines)
+
+
+@mcp.tool(name="delete_note", description="删除笔记")
+async def delete_note(note_id: int) -> str:
+    agent = _caller()
+    conn = get_db()
+    row = conn.execute("SELECT * FROM notes WHERE id=? AND is_deleted=0", (note_id,)).fetchone()
+    if not row:
+        conn.close()
+        return "❌ 笔记不存在"
+    conn.execute("UPDATE notes SET is_deleted=1 WHERE id=?", (note_id,))
+    conn.commit()
+    conn.close()
+    return f"✅ 笔记『{row['title']}』已删除"
 
 
 # ===================================================================
